@@ -18,6 +18,15 @@ namespace QuickLook.Plugin.ThreeMFViewer
     public class Plugin : IViewer
     {
         private int _viewGeneration;
+
+        // QuickLook's own working set before our preview started, so a big preview is
+        // trimmed back to what this machine normally uses, not to a fixed number.
+        private static long _baselineWs;
+        private static volatile bool _previewOpen;
+        private const long Slack = 40L * 1024 * 1024;   // extra memory left resident above that
+
+        [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+        private static extern bool SetProcessWorkingSetSizeEx(IntPtr process, IntPtr min, IntPtr max, uint flags);
         // Higher than baseline viewers (priority 0): on QL 4.5 the built-in
         // HelixViewer cannot load assimp.dll for .3mf, so we should win the routing.
         public int Priority => 10;
@@ -52,6 +61,19 @@ namespace QuickLook.Plugin.ThreeMFViewer
                 }
             }
             catch { /* never crash the host */ }
+        }
+
+        // Keep the user's file path and profile folder out of the log.
+        private static string Scrub(string text, string path)
+        {
+            try
+            {
+                if (!string.IsNullOrEmpty(path)) text = text.Replace(path, "<file>");
+                var profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                if (!string.IsNullOrEmpty(profile)) text = text.Replace(profile, "<user folder>");
+            }
+            catch { /* never crash the host */ }
+            return text;
         }
 
         // ---------------- orbit around model pivot ----------------------------
@@ -104,13 +126,15 @@ namespace QuickLook.Plugin.ThreeMFViewer
             }
         }
 
-        private static void Orbit(HelixViewport3D vp, Point3D pivot, double dx, double dy)
+        private static void Orbit(HelixViewport3D vp, double dx, double dy)
         {
             try
             {
                 var cam = vp.Camera as PerspectiveCamera;
                 if (cam == null) { Trap("orbit: camera is not a PerspectiveCamera"); return; }
 
+                // Pivot on the current look target so a previous pan is kept.
+                var pivot = cam.Position + cam.LookDirection;
                 var offset = cam.Position - pivot;
                 var up = cam.UpDirection;
                 if (offset.Length < 1e-9 || up.Length < 1e-9) return;
@@ -145,6 +169,14 @@ namespace QuickLook.Plugin.ThreeMFViewer
 
         public void Init()
         {
+            NoteBaseline();   // QuickLook's size at startup, before any preview window exists
+        }
+
+        // Keep the lowest working set seen: that is how big this machine's QuickLook is when idle.
+        private static void NoteBaseline()
+        {
+            var ws = System.Diagnostics.Process.GetCurrentProcess().WorkingSet64;
+            if (_baselineWs == 0 || ws < _baselineWs) _baselineWs = ws;
         }
 
         public bool CanHandle(string path)
@@ -182,22 +214,59 @@ namespace QuickLook.Plugin.ThreeMFViewer
         {
             var generation = Interlocked.Increment(ref _viewGeneration);
             var dispatcher = Application.Current.Dispatcher;
+            if (!_previewOpen) // otherwise a previous preview of ours is still being cleaned up
+            {
+                NoteBaseline();
+                _previewOpen = true;
+            }
             context.IsBusy = true;
             context.Title = Path.GetFileName(path);
-            Trap($"===== View: {path} ({new FileInfo(path).Length / 1024.0 / 1024.0:0.#} MB)");
+            Trap($"===== View {Path.GetExtension(path)} ({new FileInfo(path).Length / 1024.0 / 1024.0:0.#} MB)");
 
             // Parsing and mesh preparation are CPU-heavy. Keep them off QuickLook's UI
             // thread so large 3MFs do not make the whole preview appear hung.
-            Task.Run(() => ThreeMFScene.Load(path)).ContinueWith(task =>
+            // Show a live count while loading so a big file does not look stuck.
+            var progress = new LoadProgress();
+            var loading = new TextBlock
+            {
+                Margin = new Thickness(16),
+                HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center,
+                TextAlignment = TextAlignment.Center,
+                FontSize = 16,
+                Text = "Loading…",
+            };
+            var timer = new System.Windows.Threading.DispatcherTimer(
+                System.Windows.Threading.DispatcherPriority.Background, dispatcher)
+            { Interval = TimeSpan.FromMilliseconds(250) };
+            timer.Tick += (s, e) =>
+            {
+                if (generation != Volatile.Read(ref _viewGeneration)) { timer.Stop(); return; }
+                var n = progress.Triangles;
+                loading.Text = n > 0
+                    ? $"Loading… {n:N0} triangles read\n{progress.Phase}"
+                    : $"Loading… {progress.Phase}";
+                // The busy indicator may cover the view, so show the count in the title too.
+                context.Title = Path.GetFileName(path) + (n > 0 ? $"   —   loading {n:N0} triangles" : "   —   loading…");
+            };
+            dispatcher.BeginInvoke(new Action(() =>
+            {
+                if (generation != Volatile.Read(ref _viewGeneration)) return;
+                context.ViewerContent = loading;
+                timer.Start();
+            }));
+
+            Task.Run(() => ThreeMFScene.Load(path, progress)).ContinueWith(task =>
             {
                 dispatcher.BeginInvoke(new Action(() =>
                 {
+                    timer.Stop();
                     // A newer preview may have replaced this one while loading.
                     if (generation != Volatile.Read(ref _viewGeneration)) return;
                     if (task.IsFaulted)
                     {
                         var error = task.Exception?.GetBaseException() ?? new Exception("Unknown load error.");
-                        Trap("VIEW EXCEPTION: " + error);
+                        Trap("VIEW EXCEPTION: " + Scrub(error.ToString(), path));
                         context.ViewerContent = new TextBlock
                         {
                             Margin = new Thickness(16),
@@ -237,15 +306,6 @@ namespace QuickLook.Plugin.ThreeMFViewer
                         ShowCoordinateSystem = false,
                     };
 
-                    // --- trap: journal every mouse event the viewport sees ---
-
-                    var trapN = 0;
-                    void M(string tag, MouseEventArgs e)
-                    {
-                        if (trapN++ < 80)
-                            Trap($"M {tag} pos={e.GetPosition(viewport):0} captured={(e.MouseDevice.Captured == null ? "none" : e.MouseDevice.Captured.GetType().Name)}");
-                    }
-
                     // --- left-drag orbits and right-drag pans; capture input so
                     //     QuickLook's window drag does not take over ---
                     var rotating = false;
@@ -254,7 +314,6 @@ namespace QuickLook.Plugin.ThreeMFViewer
 
                     viewport.PreviewMouseLeftButtonDown += (s, e) =>
                     {
-                        M("O-LEFT-DOWN", e);
                         e.Handled = true;
                         rotating = true;
                         last = e.GetPosition(viewport);
@@ -262,19 +321,17 @@ namespace QuickLook.Plugin.ThreeMFViewer
                     };
                     viewport.PreviewMouseMove += (s, e) =>
                     {
-                        M("DRAG-MOVE", e);
                         if ((!rotating && !panning) || Mouse.Captured != viewport) return;
                         var p = e.GetPosition(viewport);
                         var dx = p.X - last.X;
                         var dy = p.Y - last.Y;
                         if (Math.Abs(dx) < 1e-9 && Math.Abs(dy) < 1e-9) return;
                         last = p;
-                        if (rotating) Orbit(viewport, scene.Center, dx, dy);
+                        if (rotating) Orbit(viewport, dx, dy);
                         else Pan(viewport, scene.Radius, dx, dy);
                     };
                     viewport.PreviewMouseLeftButtonUp += (s, e) =>
                     {
-                        M("O-LEFT-UP", e);
                         if (rotating)
                         {
                             rotating = false;
@@ -284,7 +341,6 @@ namespace QuickLook.Plugin.ThreeMFViewer
                     };
                     viewport.PreviewMouseRightButtonDown += (s, e) =>
                     {
-                        M("P-RIGHT-DOWN", e);
                         e.Handled = true;
                         panning = true;
                         last = e.GetPosition(viewport);
@@ -292,7 +348,6 @@ namespace QuickLook.Plugin.ThreeMFViewer
                     };
                     viewport.PreviewMouseRightButtonUp += (s, e) =>
                     {
-                        M("P-RIGHT-UP", e);
                         if (panning)
                         {
                             panning = false;
@@ -426,7 +481,7 @@ namespace QuickLook.Plugin.ThreeMFViewer
             catch (Exception e)
             {
                 // Never crash the host process: degrade to an error panel.
-                Trap("VIEW EXCEPTION: " + e);
+                Trap("VIEW EXCEPTION: " + Scrub(e.ToString(), path));
                 context.ViewerContent = new TextBlock
                 {
                     Margin = new Thickness(16),
@@ -442,7 +497,31 @@ namespace QuickLook.Plugin.ThreeMFViewer
 
         public void Cleanup()
         {
-            Interlocked.Increment(ref _viewGeneration);
+            var generation = Interlocked.Increment(ref _viewGeneration);
+            // Once QuickLook has dropped the preview, release its large lists and 3D
+            // render data now; an idle process may not collect them for a long time.
+            Task.Delay(1000).ContinueWith(_ =>
+            {
+                if (generation != Volatile.Read(ref _viewGeneration)) return; // another preview started
+                System.Runtime.GCSettings.LargeObjectHeapCompactionMode = System.Runtime.GCLargeObjectHeapCompactionMode.CompactOnce;
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+                GC.Collect();
+
+                // A hidden preview window gets no render pass, so WPF can keep the closed
+                // preview's 3D buffers resident until the next preview is shown. If QuickLook
+                // is far above the size it had before our preview, trim it back to about that
+                // size (plus some slack): the most recently used pages stay resident, and
+                // the cap is lifted at once.
+                var self = System.Diagnostics.Process.GetCurrentProcess();
+                var target = _baselineWs + Slack;
+                if (self.WorkingSet64 > _baselineWs + 2 * Slack)
+                {
+                    SetProcessWorkingSetSizeEx(self.Handle, (IntPtr)Math.Min(16L * 1024 * 1024, target), (IntPtr)target, 0);
+                    SetProcessWorkingSetSizeEx(self.Handle, (IntPtr)(200L * 1024), new IntPtr(IntPtr.Size == 8 ? 1L << 40 : int.MaxValue), 0);
+                }
+                _previewOpen = false;
+            }, TaskScheduler.Default);
         }
     }
 }

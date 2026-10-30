@@ -8,6 +8,7 @@ using System.IO;
 using System.IO.Compression;
 using System.Linq;
 using System.Text.RegularExpressions;
+using System.Threading.Tasks;
 using System.Windows.Media;
 using System.Windows.Media.Media3D;
 using System.Xml;
@@ -23,21 +24,60 @@ namespace QuickLook.Plugin.ThreeMFViewer
         public int Plate;                 // Bambu plate number, 0 if unknown
     }
 
+    // Raw geometry for one filament, kept on plain lists so the heavy steps can run
+    // in parallel. WPF meshes belong to the thread that made them until frozen,
+    // so they are only built (and frozen) once the lists are final.
+    internal sealed class MeshBuffer
+    {
+        public List<Point3D> Positions = new List<Point3D>();
+        public List<Vector3D> Normals;
+        public List<int> TriangleIndices = new List<int>();
+
+        public MeshGeometry3D ToMesh()
+        {
+            var mesh = new MeshGeometry3D
+            {
+                Positions = new Point3DCollection(Positions),
+                TriangleIndices = new Int32Collection(TriangleIndices),
+            };
+            if (Normals != null) mesh.Normals = new Vector3DCollection(Normals);
+            return mesh;
+        }
+    }
+
+    // Exact-match key for vertex dedupe. Point3D's own hash is a plain XOR of the
+    // three coordinates, which collides heavily on mesh data.
+    internal struct PointKey : IEquatable<PointKey>
+    {
+        private readonly double _x, _y, _z;
+        public PointKey(Point3D p) { _x = p.X + 0.0; _y = p.Y + 0.0; _z = p.Z + 0.0; } // + 0.0 folds -0 into +0
+        public bool Equals(PointKey o) => _x.Equals(o._x) && _y.Equals(o._y) && _z.Equals(o._z);
+        public override bool Equals(object obj) => obj is PointKey o && Equals(o);
+        public override int GetHashCode()
+        {
+            unchecked { return (_x.GetHashCode() * 397 ^ _y.GetHashCode()) * 397 ^ _z.GetHashCode(); }
+        }
+    }
+
     internal sealed class MeshSet
     {
-        private readonly Dictionary<int, Dictionary<Point3D, int>> _vertexLookup =
-            new Dictionary<int, Dictionary<Point3D, int>>();
+        private readonly Dictionary<int, Dictionary<PointKey, int>> _vertexLookup =
+            new Dictionary<int, Dictionary<PointKey, int>>();
 
+        // Raw geometry while loading; ByFilament holds the frozen WPF meshes once prepared.
+        public readonly Dictionary<int, MeshBuffer> Buffers = new Dictionary<int, MeshBuffer>();
         public readonly Dictionary<int, MeshGeometry3D> ByFilament =
             new Dictionary<int, MeshGeometry3D>();
         public bool Prepared;
 
+        public void DropLookup() => _vertexLookup.Clear();
+
         public void AddTriangle(int filament, Point3D a, Point3D b, Point3D c)
         {
-            if (!ByFilament.TryGetValue(filament, out var mesh))
+            if (!Buffers.TryGetValue(filament, out var mesh))
             {
-                ByFilament[filament] = mesh = new MeshGeometry3D();
-                _vertexLookup[filament] = new Dictionary<Point3D, int>();
+                Buffers[filament] = mesh = new MeshBuffer();
+                _vertexLookup[filament] = new Dictionary<PointKey, int>();
             }
 
             var lookup = _vertexLookup[filament];
@@ -46,21 +86,30 @@ namespace QuickLook.Plugin.ThreeMFViewer
             mesh.TriangleIndices.Add(GetVertex(mesh, lookup, c));
         }
 
-        private static int GetVertex(MeshGeometry3D mesh, Dictionary<Point3D, int> lookup, Point3D point)
+        private static int GetVertex(MeshBuffer mesh, Dictionary<PointKey, int> lookup, Point3D point)
         {
-            if (lookup.TryGetValue(point, out var index))
+            var key = new PointKey(point);
+            if (lookup.TryGetValue(key, out var index))
                 return index;
             index = mesh.Positions.Count;
             mesh.Positions.Add(point);
-            lookup.Add(point, index);
+            lookup.Add(key, index);
             return index;
         }
     }
 
+    // Read from the UI thread to show that a long load is still moving.
+    internal sealed class LoadProgress
+    {
+        public volatile int Triangles;
+        public volatile string Phase = "Reading file";
+    }
+
     internal class ThreeMFScene
     {
-        private const int MaxTrisPerFile = 900_000;  // rendered triangles cap per mesh file
+        private const int MaxTrisPerFile = 1_500_000;  // rendered triangles cap per mesh file
 
+        public LoadProgress Progress = new LoadProgress();
         public List<ScenePart> Parts = new List<ScenePart>();
         public int PartCount;
         public string[] FilamentColours = Array.Empty<string>();
@@ -71,9 +120,10 @@ namespace QuickLook.Plugin.ThreeMFViewer
         public Point3D Center = new Point3D();   // bounding centre after layout
         public double Radius = 1;                // bounding radius after layout
 
-        public static ThreeMFScene Load(string path)
+        public static ThreeMFScene Load(string path, LoadProgress progress = null)
         {
             var scene = new ThreeMFScene();
+            if (progress != null) scene.Progress = progress;
 
             using (var zip = ZipFile.OpenRead(path))
             {
@@ -123,6 +173,9 @@ namespace QuickLook.Plugin.ThreeMFViewer
                 scene.DebugLog.Add($"build items: {items.Count}");
             }
 
+            // Free the temporary lists and lookups now, on this background thread,
+            // instead of leaving them for whenever an idle process next collects.
+            GC.Collect();
             return scene;
         }
 
@@ -388,12 +441,17 @@ namespace QuickLook.Plugin.ThreeMFViewer
 
             if (!meshSet.Prepared)
             {
+                meshSet.DropLookup();
+                scene.Progress.Phase = "Simplifying and shading";
                 ReduceMeshSet(meshSet, MaxTrisPerFile, scene);
-                foreach (var mesh in meshSet.ByFilament.Values)
+                Parallel.ForEach(meshSet.Buffers.Values.ToList(), AddCreaseAwareNormals);
+                foreach (var pair in meshSet.Buffers)
                 {
-                    AddCreaseAwareNormals(mesh);
+                    var mesh = pair.Value.ToMesh();
                     if (mesh.CanFreeze) mesh.Freeze();
+                    meshSet.ByFilament[pair.Key] = mesh;
                 }
+                meshSet.Buffers.Clear();
                 meshSet.Prepared = true;
             }
             var added = false;
@@ -427,12 +485,12 @@ namespace QuickLook.Plugin.ThreeMFViewer
         // disconnected shards and long spikes.
         private static void ReduceMeshSet(MeshSet meshSet, int triangleLimit, ThreeMFScene scene)
         {
-            var totalTriangles = meshSet.ByFilament.Values.Sum(m => m.TriangleIndices.Count / 3);
+            var totalTriangles = meshSet.Buffers.Values.Sum(m => m.TriangleIndices.Count / 3);
             if (totalTriangles <= triangleLimit) return;
 
             var minX = double.MaxValue; var minY = double.MaxValue; var minZ = double.MaxValue;
             var maxX = double.MinValue; var maxY = double.MinValue; var maxZ = double.MinValue;
-            foreach (var mesh in meshSet.ByFilament.Values)
+            foreach (var mesh in meshSet.Buffers.Values)
                 foreach (var p in mesh.Positions)
                 {
                     minX = Math.Min(minX, p.X); maxX = Math.Max(maxX, p.X);
@@ -446,17 +504,45 @@ namespace QuickLook.Plugin.ThreeMFViewer
             var cellSize = maxDimension / Math.Sqrt(triangleLimit / 2.0);
             for (var attempt = 0; attempt < 8 && totalTriangles > triangleLimit; attempt++, cellSize *= 1.5)
             {
-                foreach (var filament in meshSet.ByFilament.Keys.ToList())
-                    meshSet.ByFilament[filament] = ClusterVertices(meshSet.ByFilament[filament], cellSize, minX, minY, minZ);
-                totalTriangles = meshSet.ByFilament.Values.Sum(m => m.TriangleIndices.Count / 3);
+                var size = cellSize;
+                var keys = meshSet.Buffers.Keys.ToList();
+                var clustered = new MeshBuffer[keys.Count];
+                var cells = BuildCells(meshSet, size, minX, minY, minZ);
+                Parallel.For(0, keys.Count, k => clustered[k] = ClusterVertices(meshSet.Buffers[keys[k]], size, minX, minY, minZ, cells));
+                for (var k = 0; k < keys.Count; k++)
+                    meshSet.Buffers[keys[k]] = clustered[k];
+                totalTriangles = meshSet.Buffers.Values.Sum(m => m.TriangleIndices.Count / 3);
             }
             scene.Simplified = true;
         }
 
-        private static MeshGeometry3D ClusterVertices(MeshGeometry3D source, double cellSize,
-            double minX, double minY, double minZ)
+        private sealed class CellAcc { public double X, Y, Z; public int N; }
+
+        // Mean position of every original vertex that falls in each grid cell,
+        // taken across all filaments so shared colour borders still line up.
+        // Snapping to the cell centre instead gives visible stair-steps.
+        private static Dictionary<GridKey, CellAcc> BuildCells(MeshSet ms, double cell, double minX, double minY, double minZ)
         {
-            var result = new MeshGeometry3D();
+            var d = new Dictionary<GridKey, CellAcc>();
+            foreach (var b in ms.Buffers.Values)
+                foreach (var p in b.Positions)
+                {
+                    var key = new GridKey
+                    {
+                        X = (long)Math.Floor((p.X - minX) / cell),
+                        Y = (long)Math.Floor((p.Y - minY) / cell),
+                        Z = (long)Math.Floor((p.Z - minZ) / cell),
+                    };
+                    if (!d.TryGetValue(key, out var a)) d.Add(key, a = new CellAcc());
+                    a.X += p.X; a.Y += p.Y; a.Z += p.Z; a.N++;
+                }
+            return d;
+        }
+
+        private static MeshBuffer ClusterVertices(MeshBuffer source, double cellSize,
+            double minX, double minY, double minZ, Dictionary<GridKey, CellAcc> cells)
+        {
+            var result = new MeshBuffer();
             var remap = new int[source.Positions.Count];
             var lookup = new Dictionary<GridKey, int>();
             for (var i = 0; i < source.Positions.Count; i++)
@@ -472,12 +558,15 @@ namespace QuickLook.Plugin.ThreeMFViewer
                 {
                     remap[i] = result.Positions.Count;
                     lookup.Add(key, remap[i]);
-                    // Use the cell center so adjacent filament meshes collapse a
-                    // shared boundary vertex to the same location.
-                    result.Positions.Add(new Point3D(
-                        minX + (key.X + 0.5) * cellSize,
-                        minY + (key.Y + 0.5) * cellSize,
-                        minZ + (key.Z + 0.5) * cellSize));
+                    // The cell mean is shared by every filament mesh, so adjacent
+                    // meshes still collapse a shared boundary vertex to one point.
+                    if (cells.TryGetValue(key, out var acc))
+                        result.Positions.Add(new Point3D(acc.X / acc.N, acc.Y / acc.N, acc.Z / acc.N));
+                    else
+                        result.Positions.Add(new Point3D(
+                            minX + (key.X + 0.5) * cellSize,
+                            minY + (key.Y + 0.5) * cellSize,
+                            minZ + (key.Z + 0.5) * cellSize));
                 }
             }
 
@@ -494,6 +583,7 @@ namespace QuickLook.Plugin.ThreeMFViewer
 
         private static Dictionary<int, MeshSet> LoadMeshFile(ZipArchive zip, string path, ThreeMFScene scene)
         {
+            scene.Progress.Phase = "Reading file";
             var res = new Dictionary<int, MeshSet>();
             var entryName = path.TrimStart('/');
             var entry = zip.GetEntry(entryName)
@@ -517,7 +607,8 @@ namespace QuickLook.Plugin.ThreeMFViewer
                     // save a completed mesh when its </mesh> arrives
                     if (reader.NodeType == XmlNodeType.EndElement && reader.LocalName == "mesh" && meshSet != null)
                     {
-                        if (currentObjectId >= 0 && meshSet.ByFilament.Count > 0)
+                        meshSet.DropLookup();
+                        if (currentObjectId >= 0 && meshSet.Buffers.Count > 0)
                             res[currentObjectId] = meshSet;
                         meshSet = null;
                         positions = new List<Point3D>();
@@ -545,6 +636,7 @@ namespace QuickLook.Plugin.ThreeMFViewer
                             break;
 
                         case "triangle" when meshSet != null:
+                            scene.Progress.Triangles++;
                             AddTriangle(meshSet, positions,
                                 (int)Double(reader.GetAttribute("v1")),
                                 (int)Double(reader.GetAttribute("v2")),
@@ -578,6 +670,7 @@ namespace QuickLook.Plugin.ThreeMFViewer
                         (int)Double(AttributeValue(t, "v2")),
                         (int)Double(AttributeValue(t, "v3")),
                         PaintAttribute(t), fallbackFilament, scene.FilamentColours.Length);
+            meshSet.DropLookup();
             return meshSet;
         }
 
@@ -745,14 +838,14 @@ namespace QuickLook.Plugin.ThreeMFViewer
         // 3MF stores indexed triangles but not smooth vertex normals. Build a
         // shaded mesh by averaging neighboring face normals, splitting vertices
         // at sharp creases so embossed edges and medal rims stay defined.
-        private static void AddCreaseAwareNormals(MeshGeometry3D mesh)
+        private static void AddCreaseAwareNormals(MeshBuffer mesh)
         {
             if (mesh == null || mesh.Positions.Count == 0 || mesh.TriangleIndices.Count < 3)
                 return;
 
             const double creaseCosine = 0.5; // preserve edges sharper than 60 degrees
             var clustersByVertex = new List<NormalCluster>[mesh.Positions.Count];
-            var smoothed = new MeshGeometry3D();
+            var smoothed = new MeshBuffer { Normals = new List<Vector3D>() };
             var sourceIndices = mesh.TriangleIndices;
 
             for (var i = 0; i + 2 < sourceIndices.Count; i += 3)
@@ -823,7 +916,7 @@ namespace QuickLook.Plugin.ThreeMFViewer
                 var v = s.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries)
                          .Select(t => double.Parse(t, CultureInfo.InvariantCulture)).ToArray();
                 if (v.Length < 12) return Matrix3D.Identity;
-                return new Matrix3D(v[0], v[3], v[6], 0, v[1], v[4], v[7], 0, v[2], v[5], v[8], 0, v[9], v[10], v[11], 1);
+                return new Matrix3D(v[0], v[1], v[2], 0, v[3], v[4], v[5], 0, v[6], v[7], v[8], 0, v[9], v[10], v[11], 1);
             }
             catch { return Matrix3D.Identity; }
         }
